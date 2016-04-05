@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?> 
+<blueprint xmlns="http://www.osgi.org/xmlns/blueprint/v1.0.0"
+xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+xmlns:cm="http://aries.apache.org/blueprint/xmlns/blueprint-cm/v1.1.0"
+xsi:schemaLocation="http://aries.apache.org/blueprint/xmlns/blueprint-cm/v1.1.0
+http://aries.apache.org/schemas/blueprint-cm/blueprint-cm-1.1.0.xsd http://www.osgi.org/xmlns/blueprint/v1.0.0
+http://www.osgi.org/xmlns/blueprint/v1.0.0/blueprint.xsd http://camel.apache.org/schema/blueprint
+http://camel.apache.org/schema/blueprint/camel-blueprint.xsd">
+
+    <!-- OSGI blueprint property placeholder -->
+    <cm:property-placeholder id="properties" persistent-id="camp.fcrepo" update-strategy="reload">
+        <cm:default-properties>
+            <cm:property name="fcrepo.authUsername" value="fedoraAdmin"/>
+            <cm:property name="fcrepo.authPassword" value="secret3"/>
+            <cm:property name="fcrepo.authHost" value=""/>
+            <cm:property name="fcrepo.eventStream" value="activemq:topic:fedora"/>
+            <cm:property name="fcrepo.baseUrl" value="localhost:8080/fcrepo/rest"/>
+            <cm:property name="fcrepo.binaryDir" value="/tmp/derivatives/master/"/>
+            <cm:property name="fcrepo.binaryDirThumb" value="/tmp/derivatives/"/>
+            <cm:property name="fcrepo.rdfSerialization" value="text/turtle"/>
+        </cm:default-properties>
+    </cm:property-placeholder>
+    <!-- configuration of activemq component -->
+    <bean id="activemq" class="org.apache.activemq.camel.component.ActiveMQComponent">
+        <property name="brokerURL" value="tcp://localhost:61616"/>
+    </bean>
+    <!-- component-wide configuration of fcrepo -->
+    <bean id="fcrepo" class="org.fcrepo.camel.FcrepoComponent">
+        <property name="authUsername" value="${fcrepo.authUsername}"/>
+        <property name="authPassword" value="${fcrepo.authPassword}"/>
+        <property name="authHost" value="${fcrepo.authHost}"/>
+    </bean>
+    <!-- Let's add some tracing to see what is happening -->
+    <bean id="camelTracer" class="org.apache.camel.processor.interceptor.Tracer">
+        <property name="traceOutExchanges" value="true"/>
+    </bean>
+    <bean id="tracerFormatter" class="org.apache.camel.processor.interceptor.DefaultTraceFormatter">
+        <!--	<property name="showBreadCrumb" value="true" />
+        <property name="showProperties" value="true" />-->
+        <property name="showHeaders" value="true"/>
+        <property name="showOutBody" value="false"/>
+        <property name="showOutBodyType" value="false"/>
+        <property name="showBody" value="true"/>
+    </bean>
+    <camelContext xmlns="http://camel.apache.org/schema/blueprint" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:ebucore="http://www.ebu.ch/metadata/ontologies/ebucore/ebucore#" xmlns:fedora="http://fedora.info/definitions/v4/repository#" trace="true">
+
+        <route id="mainListener">
+            <from uri="{{fcrepo.eventStream}}"/>
+            <filter>
+                <simple>${headers[org.fcrepo.jms.eventType]} not contains 'NODE_REMOVED'</simple>
+                <to uri="fcrepo:{{fcrepo.baseUrl}}"/>
+                <choice>
+                    <when>
+                        <simple>${headers[org.fcrepo.jms.identifier]} regex '.*/thumb$'</simple>
+                        <log message="This is a thumb, won't process or we could get into an infinite loop"/>
+                        <stop/>
+                    </when>
+                    <when>
+                      <xpath>/rdf:RDF/rdf:Description/rdf:type[@rdf:resource='http://fedora.info/definitions/v4/repository#Binary']
+                        and /rdf:RDF/rdf:Description/ebucore:hasMimeType[text() = 'image/jpeg']
+                      </xpath>
+                        <setHeader headerName="thumb.ParentResourcePath">
+                          <xpath resultType="java.lang.String">
+                            /rdf:RDF/rdf:Description/fedora:hasParent[1]/@rdf:resource
+                          </xpath>
+                        </setHeader>
+                      <setProperty propertyName="ResourcePath">
+                                <simple>${headers[org.fcrepo.jms.identifier]}</simple>
+                            </setProperty>
+                            <to uri="direct:getBinary"/>
+                        </when>
+                        <otherwise>
+                            <log message="Not an JPEG, won't process"/>
+                            <stop/>
+                        </otherwise>
+                    </choice>
+                </filter>
+            </route>
+            <route id="getBinary">
+                <from uri="direct:getBinary"/>
+                <setHeader headerName="Accept">
+                    <constant>*/*</constant>
+                </setHeader>
+                <setHeader headerName="Exchange.HTTP_METHOD">
+                    <constant>GET</constant>
+                </setHeader>
+                <setHeader headerName="CamelFcrepoIdentifier">
+                    <simple>${property.ResourcePath}</simple>
+                </setHeader>
+
+                <to uri="fcrepo:{{fcrepo.baseUrl}}?metadata=false"/>
+
+                <setProperty propertyName="thumb.ParentResourcePath">
+                    <simple>${headers[thumb.ParentResourcePath]}</simple>
+                </setProperty>
+
+                <to uri="file:{{fcrepo.binaryDir}}"/>
+
+                <log message="Ok, starting Poll and wait for thumb, let's empty the body!"/>
+                <transform>
+                    <simple></simple>
+                </transform>
+
+                <pollEnrich timeout="100000">
+                    <constant>activemq:topic:thumb.created</constant>
+                </pollEnrich>
+                <log message="Ok, did i get something? ${body}"/>
+                <choice>
+                    <when>
+                        <simple>${body} != null</simple>
+                        <setProperty propertyName="ThumbFileName">
+                            <simple>
+                                ${body}
+                            </simple>
+                        </setProperty>
+                        <pollEnrich timeout="10000">
+                            <simple>file:{{fcrepo.binaryDirThumb}}?fileName=${property.ThumbFileName}</simple>
+                        </pollEnrich>
+                        <filter>
+                            <simple>${headers.CamelFileNameConsumed} == ${property.ThumbFileName}</simple>
+                            <to uri="direct:PutThumbIntoFedora"/>
+                        </filter>
+                    </when>
+                </choice>
+            </route>
+
+            <!-- In the meantime, completely disconnect from fedora's info waits the file listener-->
+            
+            <route id="processThumb">
+                <from uri="file:{{fcrepo.binaryDir}}?delete=false"/>
+                <log message="Starting Thumb Process for ${header.CamelFileNameProduced} and ID: ${id}"/>
+                <setHeader headerName="CamelExecCommandArgs">
+                    <simple>- -thumbnail 200x200 ${id}thumb.jpg</simple>
+                </setHeader>
+                <setHeader headerName="CamelExecCommandOutFile">
+                    <simple>{{fcrepo.binaryDirThumb}}${id}thumb.jpg</simple>
+                </setHeader>
+                <setHeader headerName="CamelExecCommandWorkingDir">
+                    <simple>{{fcrepo.binaryDirThumb}}</simple>
+                </setHeader>
+                
+                <to uri="exec:convert?useStderrOnEmptyStdout=false"/>
+                
+                <choice>
+                    <when>
+                        <simple>
+                            ${headers.CamelExecExitValue} == 0
+                        </simple>
+                        <log message="Good, thumb done and ready at ${headers[CamelExecCommandOutFile]}"/>
+                        <setBody>
+                            <simple>
+                                ${id}thumb.jpg
+                            </simple>
+                        </setBody>
+                        <convertBodyTo type="java.lang.String"/>
+                        <to uri="activemq:topic:thumb.created?jmsMessageType=Text"/>
+                    </when>
+                </choice>
+            </route>
+            <route id="PutThumbIntoFedora">
+                <from uri="direct:PutThumbIntoFedora"/>
+                <setHeader headerName="Content-Type">
+                    <simple>image/jpeg</simple>
+                </setHeader>
+                <setHeader headerName="Exchange.HTTP_METHOD">
+                    <constant>PUT</constant>
+                </setHeader>
+                <removeHeaders pattern="CamelFcrepo*"/>
+                <removeHeaders pattern="org.fcrepo.jms.identifier"/>
+                <recipientList>
+                    <simple>
+                        fcrepo:${property[thumb.ParentResourcePath]}/thumb
+                    </simple>
+                </recipientList>
+            </route>
+        </camelContext>
+    </blueprint>
